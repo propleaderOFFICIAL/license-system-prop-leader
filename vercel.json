@@ -1,12 +1,44 @@
 {
   "version": 2,
+  "name": "license-relay",
   "builds": [
-    { "src": "api/license-check.js", "use": "@vercel/node" }
+    {
+      "src": "api/license-check.js",
+      "use": "@vercel/node"
+    }
   ],
   "routes": [
     {
       "src": "/api/license-check",
       "dest": "/api/license-check.js"
+    }
+  ],
+  "env": {
+    "NODE_ENV": "production"
+  },
+  "functions": {
+    "api/license-check.js": {
+      "maxDuration": 30,
+      "memory": 1024
+    }
+  },
+  "headers": [
+    {
+      "source": "/api/(.*)",
+      "headers": [
+        {
+          "key": "X-Content-Type-Options",
+          "value": "nosniff"
+        },
+        {
+          "key": "X-Frame-Options",
+          "value": "DENY"
+        },
+        {
+          "key": "X-XSS-Protection",
+          "value": "1; mode=block"
+        }
+      ]
     }
   ]
 }
