@@ -1,7 +1,7 @@
 // api/license-check.js
 export const config = {
-  runtime: 'nodejs18.x',
-  maxDuration: 30, // Max 30 secondi per Vercel Hobby (10 per default)
+  runtime: 'nodejs',
+  maxDuration: 30, // Solo se hai Vercel Pro, altrimenti rimuovi questa riga
 };
 
 // Configurazione
