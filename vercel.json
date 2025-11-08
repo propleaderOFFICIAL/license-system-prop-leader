@@ -1,0 +1,12 @@
+{
+  "version": 2,
+  "builds": [
+    { "src": "api/license-check.js", "use": "@vercel/node" }
+  ],
+  "routes": [
+    {
+      "src": "/api/license-check",
+      "dest": "/api/license-check.js"
+    }
+  ]
+}
