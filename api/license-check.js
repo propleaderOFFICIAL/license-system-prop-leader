@@ -14,10 +14,9 @@ function getCorsHeaders(origin) {
 
   return {
     'Access-Control-Allow-Origin': allowOrigin,
-    'Access-Control-Allow-Methods': 'POST, OPTIONS',
+    'Access-Control-Allow-Methods': 'POST, GET, OPTIONS',
     'Access-Control-Allow-Headers': 'Content-Type, Authorization, X-Requested-With, User-Agent',
     'Access-Control-Max-Age': '86400',
-    'Access-Control-Allow-Credentials': 'true',
   };
 }
 
@@ -42,95 +41,148 @@ async function fetchWithTimeout(url, options = {}, timeoutMs = DEFAULT_TIMEOUT_M
 }
 
 /**
- * Converte POST in GET con query parameters dopo il primo redirect
+ * Segue redirect convertendo POST->GET al primo redirect
  */
-async function followRedirectsWithMethodSwitch(url, jsonBody, timeoutMs, maxRedirects = MAX_REDIRECTS) {
-  let currentUrl = url;
+async function handleGoogleAppsScriptRedirect(initialUrl, jsonBody, timeoutMs, maxRedirects = MAX_REDIRECTS) {
   let redirectCount = 0;
-  let usePost = true; // Prima richiesta usa POST
+  
+  // STEP 1: Prima richiesta POST all'URL originale
+  console.log(`[1] POST ${initialUrl}`);
+  
+  const firstResponse = await fetchWithTimeout(
+    initialUrl,
+    {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Accept': 'application/json',
+        'User-Agent': 'MT5-VercelRelay/2.0',
+      },
+      body: jsonBody,
+      redirect: 'manual',
+    },
+    timeoutMs
+  );
 
-  while (redirectCount <= maxRedirects) {
-    let options;
+  // Se la prima richiesta ha successo (nessun redirect)
+  if (firstResponse.status >= 200 && firstResponse.status < 300) {
+    console.log(`[1] Direct success: ${firstResponse.status}`);
+    return firstResponse;
+  }
 
-    if (usePost) {
-      // Prima richiesta: POST con JSON body
-      options = {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          'Accept': 'application/json, text/plain, */*',
-          'User-Agent': 'MT5-VercelRelay/2.0',
-        },
-        body: jsonBody,
-        redirect: 'manual',
-      };
-      console.log(`Request ${redirectCount + 1}: POST ${currentUrl}`);
-    } else {
-      // Dopo redirect: GET con query parameters
-      try {
-        const data = JSON.parse(jsonBody);
-        const params = new URLSearchParams();
-        
-        // Converti ogni campo in query parameter
-        for (const [key, value] of Object.entries(data)) {
-          if (value !== null && value !== undefined) {
-            params.append(key, typeof value === 'object' ? JSON.stringify(value) : String(value));
-          }
-        }
-        
-        // Aggiungi parameters all'URL
-        const separator = currentUrl.includes('?') ? '&' : '?';
-        currentUrl = `${currentUrl}${separator}${params.toString()}`;
-      } catch (e) {
-        console.error('Error converting POST to GET:', e);
+  // Se non è un redirect, ritorna l'errore
+  if (firstResponse.status < 300 || firstResponse.status >= 400) {
+    console.log(`[1] Non-redirect response: ${firstResponse.status}`);
+    return firstResponse;
+  }
+
+  // STEP 2: Ottieni l'URL del redirect
+  const redirectLocation = firstResponse.headers.get('location');
+  if (!redirectLocation) {
+    console.log('[1] Redirect without location header');
+    return firstResponse;
+  }
+
+  const redirectUrl = redirectLocation.startsWith('http')
+    ? redirectLocation
+    : new URL(redirectLocation, initialUrl).toString();
+
+  console.log(`[1] Redirected to: ${redirectUrl}`);
+  redirectCount++;
+
+  // STEP 3: Converti il JSON in query parameters
+  let finalUrl = redirectUrl;
+  try {
+    const data = JSON.parse(jsonBody);
+    const params = new URLSearchParams();
+    
+    for (const [key, value] of Object.entries(data)) {
+      if (value !== null && value !== undefined) {
+        const stringValue = typeof value === 'object' ? JSON.stringify(value) : String(value);
+        params.append(key, stringValue);
       }
+    }
+    
+    // Aggiungi i parametri all'URL
+    const paramString = params.toString();
+    if (paramString) {
+      finalUrl = redirectUrl.includes('?')
+        ? `${redirectUrl}&${paramString}`
+        : `${redirectUrl}?${paramString}`;
+    }
+  } catch (e) {
+    console.error('[2] Error parsing JSON:', e);
+  }
 
-      options = {
+  // STEP 4: Fai la richiesta GET finale
+  console.log(`[2] GET ${finalUrl.substring(0, 150)}...`);
+
+  const finalResponse = await fetchWithTimeout(
+    finalUrl,
+    {
+      method: 'GET',
+      headers: {
+        'Accept': 'application/json, text/plain, */*',
+        'User-Agent': 'MT5-VercelRelay/2.0',
+      },
+      redirect: 'manual',
+    },
+    timeoutMs
+  );
+
+  console.log(`[2] Response status: ${finalResponse.status}`);
+
+  // Se otteniamo un successo, ritorna
+  if (finalResponse.status >= 200 && finalResponse.status < 300) {
+    return finalResponse;
+  }
+
+  // Se c'è un altro redirect, seguilo (max 3 ulteriori hop)
+  let currentUrl = finalUrl;
+  let currentResponse = finalResponse;
+
+  while (redirectCount < maxRedirects) {
+    if (currentResponse.status < 300 || currentResponse.status >= 400) {
+      break;
+    }
+
+    const nextLocation = currentResponse.headers.get('location');
+    if (!nextLocation) {
+      break;
+    }
+
+    currentUrl = nextLocation.startsWith('http')
+      ? nextLocation
+      : new URL(nextLocation, currentUrl).toString();
+
+    redirectCount++;
+    console.log(`[${redirectCount + 1}] GET redirect to: ${currentUrl}`);
+
+    currentResponse = await fetchWithTimeout(
+      currentUrl,
+      {
         method: 'GET',
         headers: {
           'Accept': 'application/json, text/plain, */*',
           'User-Agent': 'MT5-VercelRelay/2.0',
         },
         redirect: 'manual',
-      };
-      console.log(`Request ${redirectCount + 1}: GET ${currentUrl}`);
+      },
+      timeoutMs
+    );
+
+    console.log(`[${redirectCount + 1}] Response status: ${currentResponse.status}`);
+
+    if (currentResponse.status >= 200 && currentResponse.status < 300) {
+      return currentResponse;
     }
-
-    const response = await fetchWithTimeout(currentUrl, options, timeoutMs);
-
-    // Status 2xx = successo
-    if (response.status >= 200 && response.status < 300) {
-      console.log(`Success: ${response.status}`);
-      return response;
-    }
-
-    // Status 3xx = redirect
-    if (response.status >= 300 && response.status < 400) {
-      const location = response.headers.get('location');
-      
-      if (!location) {
-        console.log('Redirect without location header');
-        return response;
-      }
-
-      // Risolvi URL relativo o assoluto
-      currentUrl = location.startsWith('http') 
-        ? location 
-        : new URL(location, currentUrl).toString();
-      
-      redirectCount++;
-      usePost = false; // Dopo il primo redirect, usa GET
-      
-      console.log(`Redirect ${redirectCount} to: ${currentUrl}`);
-      continue;
-    }
-
-    // Altri status (4xx, 5xx)
-    console.log(`Non-redirect status: ${response.status}`);
-    return response;
   }
 
-  throw new Error(`Too many redirects (max: ${maxRedirects})`);
+  if (redirectCount >= maxRedirects) {
+    throw new Error(`Too many redirects (${redirectCount})`);
+  }
+
+  return currentResponse;
 }
 
 export default async function handler(req, res) {
@@ -149,7 +201,7 @@ export default async function handler(req, res) {
   if (req.method !== 'POST') {
     return res.status(405).json({
       status: 'error',
-      message: 'Method Not Allowed. Only POST requests are accepted.',
+      message: 'Only POST method is allowed',
     });
   }
 
@@ -159,12 +211,11 @@ export default async function handler(req, res) {
     console.error('LICENSE_WEBHOOK_URL not configured');
     return res.status(500).json({
       status: 'error',
-      message: 'Server configuration error',
+      message: 'Server misconfiguration',
     });
   }
 
   try {
-    // Prepara body JSON
     let bodyToForward;
     
     if (typeof req.body === 'string') {
@@ -175,13 +226,11 @@ export default async function handler(req, res) {
       bodyToForward = JSON.stringify({});
     }
 
-    console.log('=== Incoming Request ===');
-    console.log('Target URL:', targetUrl);
-    console.log('Body length:', bodyToForward.length);
-    console.log('Body preview:', bodyToForward.substring(0, 200));
+    console.log('=== Request Start ===');
+    console.log('Target:', targetUrl);
+    console.log('Body:', bodyToForward);
 
-    // Inoltra con conversione automatica POST→GET
-    const upstreamResponse = await followRedirectsWithMethodSwitch(
+    const upstreamResponse = await handleGoogleAppsScriptRedirect(
       targetUrl,
       bodyToForward,
       DEFAULT_TIMEOUT_MS,
@@ -190,18 +239,15 @@ export default async function handler(req, res) {
 
     const responseBody = await upstreamResponse.text();
     const responseContentType = upstreamResponse.headers.get('content-type') || 'application/json; charset=utf-8';
-
     const duration = Date.now() - startTime;
-    
+
     console.log('=== Response ===');
     console.log('Status:', upstreamResponse.status);
     console.log('Duration:', duration, 'ms');
-    console.log('Body length:', responseBody.length);
-    console.log('Body preview:', responseBody.substring(0, 200));
+    console.log('Body preview:', responseBody.substring(0, 300));
 
     res.setHeader('Content-Type', responseContentType);
     res.setHeader('X-Relay-Duration', duration.toString());
-    res.setHeader('X-Relay-Method', 'POST-to-GET');
 
     return res.status(upstreamResponse.status).send(responseBody);
 
@@ -210,10 +256,11 @@ export default async function handler(req, res) {
     
     console.error('=== Error ===');
     console.error('Message:', error.message);
+    console.error('Stack:', error.stack);
     console.error('Duration:', duration, 'ms');
 
     let statusCode = 502;
-    let errorMessage = 'Upstream relay error';
+    let errorMessage = 'Relay error';
 
     if (error.message.includes('timeout')) {
       statusCode = 504;
