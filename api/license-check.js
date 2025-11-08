@@ -4,23 +4,18 @@ export const config = {
 };
 
 const ALLOWED_ORIGINS = ['*'];
-const DEFAULT_TIMEOUT_MS = 9000;
-const MAX_REDIRECTS = 5;
+const REQUEST_TIMEOUT_MS = 25000;
 
 function getCorsHeaders(origin) {
-  const allowOrigin = ALLOWED_ORIGINS.includes('*') || ALLOWED_ORIGINS.includes(origin)
-    ? origin || '*'
-    : ALLOWED_ORIGINS[0] || '*';
-
   return {
-    'Access-Control-Allow-Origin': allowOrigin,
-    'Access-Control-Allow-Methods': 'POST, GET, OPTIONS',
-    'Access-Control-Allow-Headers': 'Content-Type, Authorization, X-Requested-With, User-Agent',
+    'Access-Control-Allow-Origin': origin || '*',
+    'Access-Control-Allow-Methods': 'POST, OPTIONS',
+    'Access-Control-Allow-Headers': 'Content-Type, User-Agent',
     'Access-Control-Max-Age': '86400',
   };
 }
 
-async function fetchWithTimeout(url, options = {}, timeoutMs = DEFAULT_TIMEOUT_MS) {
+async function fetchWithTimeout(url, options, timeoutMs) {
   const controller = new AbortController();
   const timeoutId = setTimeout(() => controller.abort(), timeoutMs);
   
@@ -33,244 +28,123 @@ async function fetchWithTimeout(url, options = {}, timeoutMs = DEFAULT_TIMEOUT_M
     return response;
   } catch (error) {
     clearTimeout(timeoutId);
-    if (error.name === 'AbortError') {
-      throw new Error(`Request timeout after ${timeoutMs}ms`);
-    }
     throw error;
   }
 }
 
-/**
- * Segue redirect convertendo POST->GET al primo redirect
- */
-async function handleGoogleAppsScriptRedirect(initialUrl, jsonBody, timeoutMs, maxRedirects = MAX_REDIRECTS) {
-  let redirectCount = 0;
-  
-  // STEP 1: Prima richiesta POST all'URL originale
-  console.log(`[1] POST ${initialUrl}`);
-  
-  const firstResponse = await fetchWithTimeout(
-    initialUrl,
-    {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'Accept': 'application/json',
-        'User-Agent': 'MT5-VercelRelay/2.0',
-      },
-      body: jsonBody,
-      redirect: 'manual',
-    },
-    timeoutMs
-  );
-
-  // Se la prima richiesta ha successo (nessun redirect)
-  if (firstResponse.status >= 200 && firstResponse.status < 300) {
-    console.log(`[1] Direct success: ${firstResponse.status}`);
-    return firstResponse;
-  }
-
-  // Se non è un redirect, ritorna l'errore
-  if (firstResponse.status < 300 || firstResponse.status >= 400) {
-    console.log(`[1] Non-redirect response: ${firstResponse.status}`);
-    return firstResponse;
-  }
-
-  // STEP 2: Ottieni l'URL del redirect
-  const redirectLocation = firstResponse.headers.get('location');
-  if (!redirectLocation) {
-    console.log('[1] Redirect without location header');
-    return firstResponse;
-  }
-
-  const redirectUrl = redirectLocation.startsWith('http')
-    ? redirectLocation
-    : new URL(redirectLocation, initialUrl).toString();
-
-  console.log(`[1] Redirected to: ${redirectUrl}`);
-  redirectCount++;
-
-  // STEP 3: Converti il JSON in query parameters
-  let finalUrl = redirectUrl;
-  try {
-    const data = JSON.parse(jsonBody);
-    const params = new URLSearchParams();
-    
-    for (const [key, value] of Object.entries(data)) {
-      if (value !== null && value !== undefined) {
-        const stringValue = typeof value === 'object' ? JSON.stringify(value) : String(value);
-        params.append(key, stringValue);
-      }
-    }
-    
-    // Aggiungi i parametri all'URL
-    const paramString = params.toString();
-    if (paramString) {
-      finalUrl = redirectUrl.includes('?')
-        ? `${redirectUrl}&${paramString}`
-        : `${redirectUrl}?${paramString}`;
-    }
-  } catch (e) {
-    console.error('[2] Error parsing JSON:', e);
-  }
-
-  // STEP 4: Fai la richiesta GET finale
-  console.log(`[2] GET ${finalUrl.substring(0, 150)}...`);
-
-  const finalResponse = await fetchWithTimeout(
-    finalUrl,
-    {
-      method: 'GET',
-      headers: {
-        'Accept': 'application/json, text/plain, */*',
-        'User-Agent': 'MT5-VercelRelay/2.0',
-      },
-      redirect: 'manual',
-    },
-    timeoutMs
-  );
-
-  console.log(`[2] Response status: ${finalResponse.status}`);
-
-  // Se otteniamo un successo, ritorna
-  if (finalResponse.status >= 200 && finalResponse.status < 300) {
-    return finalResponse;
-  }
-
-  // Se c'è un altro redirect, seguilo (max 3 ulteriori hop)
-  let currentUrl = finalUrl;
-  let currentResponse = finalResponse;
-
-  while (redirectCount < maxRedirects) {
-    if (currentResponse.status < 300 || currentResponse.status >= 400) {
-      break;
-    }
-
-    const nextLocation = currentResponse.headers.get('location');
-    if (!nextLocation) {
-      break;
-    }
-
-    currentUrl = nextLocation.startsWith('http')
-      ? nextLocation
-      : new URL(nextLocation, currentUrl).toString();
-
-    redirectCount++;
-    console.log(`[${redirectCount + 1}] GET redirect to: ${currentUrl}`);
-
-    currentResponse = await fetchWithTimeout(
-      currentUrl,
-      {
-        method: 'GET',
-        headers: {
-          'Accept': 'application/json, text/plain, */*',
-          'User-Agent': 'MT5-VercelRelay/2.0',
-        },
-        redirect: 'manual',
-      },
-      timeoutMs
-    );
-
-    console.log(`[${redirectCount + 1}] Response status: ${currentResponse.status}`);
-
-    if (currentResponse.status >= 200 && currentResponse.status < 300) {
-      return currentResponse;
-    }
-  }
-
-  if (redirectCount >= maxRedirects) {
-    throw new Error(`Too many redirects (${redirectCount})`);
-  }
-
-  return currentResponse;
-}
-
 export default async function handler(req, res) {
   const startTime = Date.now();
-  const origin = req.headers.origin || req.headers.referer || '*';
+  const origin = req.headers.origin || '*';
   const corsHeaders = getCorsHeaders(origin);
 
+  // CORS headers
   Object.entries(corsHeaders).forEach(([key, value]) => {
     res.setHeader(key, value);
   });
 
+  // Preflight
   if (req.method === 'OPTIONS') {
     return res.status(204).end();
   }
 
+  // Solo POST
   if (req.method !== 'POST') {
     return res.status(405).json({
       status: 'error',
-      message: 'Only POST method is allowed',
+      message: 'Only POST allowed',
     });
   }
 
-  const targetUrl = process.env.LICENSE_WEBHOOK_URL;
+  const gasUrl = process.env.LICENSE_WEBHOOK_URL;
   
-  if (!targetUrl) {
+  if (!gasUrl) {
     console.error('LICENSE_WEBHOOK_URL not configured');
     return res.status(500).json({
       status: 'error',
-      message: 'Server misconfiguration',
+      message: 'Server configuration error',
     });
   }
 
   try {
-    let bodyToForward;
-    
+    // Parse body
+    let bodyData;
     if (typeof req.body === 'string') {
-      bodyToForward = req.body;
-    } else if (req.body && typeof req.body === 'object') {
-      bodyToForward = JSON.stringify(req.body);
+      bodyData = JSON.parse(req.body);
     } else {
-      bodyToForward = JSON.stringify({});
+      bodyData = req.body || {};
     }
 
-    console.log('=== Request Start ===');
-    console.log('Target:', targetUrl);
-    console.log('Body:', bodyToForward);
+    console.log('=== REQUEST ===');
+    console.log('License Key:', bodyData.licenseKey);
+    console.log('Product:', bodyData.product);
 
-    const upstreamResponse = await handleGoogleAppsScriptRedirect(
-      targetUrl,
-      bodyToForward,
-      DEFAULT_TIMEOUT_MS,
-      MAX_REDIRECTS
+    // Converti in query string per GET (Google Apps Script gestisce meglio GET dopo redirect)
+    const params = new URLSearchParams();
+    Object.entries(bodyData).forEach(([key, value]) => {
+      if (value !== null && value !== undefined) {
+        params.append(key, String(value));
+      }
+    });
+
+    const finalUrl = `${gasUrl}?${params.toString()}`;
+    
+    console.log('Calling:', gasUrl);
+
+    // Fai richiesta GET (evita problemi con redirect)
+    const response = await fetchWithTimeout(
+      finalUrl,
+      {
+        method: 'GET',
+        headers: {
+          'Accept': 'application/json',
+          'User-Agent': 'Vercel-MT5-Relay/3.0',
+        },
+      },
+      REQUEST_TIMEOUT_MS
     );
 
-    const responseBody = await upstreamResponse.text();
-    const responseContentType = upstreamResponse.headers.get('content-type') || 'application/json; charset=utf-8';
+    const responseText = await response.text();
     const duration = Date.now() - startTime;
 
-    console.log('=== Response ===');
-    console.log('Status:', upstreamResponse.status);
+    console.log('=== RESPONSE ===');
+    console.log('Status:', response.status);
     console.log('Duration:', duration, 'ms');
-    console.log('Body preview:', responseBody.substring(0, 300));
+    console.log('Body:', responseText.substring(0, 200));
 
-    res.setHeader('Content-Type', responseContentType);
-    res.setHeader('X-Relay-Duration', duration.toString());
+    // Parse response
+    let responseData;
+    try {
+      responseData = JSON.parse(responseText);
+    } catch (e) {
+      console.error('JSON parse error:', e);
+      responseData = {
+        status: 'error',
+        message: 'Invalid response from license server',
+        raw: responseText.substring(0, 100),
+      };
+    }
 
-    return res.status(upstreamResponse.status).send(responseBody);
+    res.setHeader('Content-Type', 'application/json');
+    res.setHeader('X-Response-Time', `${duration}ms`);
+
+    return res.status(response.status).json(responseData);
 
   } catch (error) {
     const duration = Date.now() - startTime;
     
-    console.error('=== Error ===');
+    console.error('=== ERROR ===');
     console.error('Message:', error.message);
-    console.error('Stack:', error.stack);
     console.error('Duration:', duration, 'ms');
 
     let statusCode = 502;
-    let errorMessage = 'Relay error';
+    let errorMessage = 'License server error';
 
-    if (error.message.includes('timeout')) {
+    if (error.name === 'AbortError' || error.message.includes('timeout')) {
       statusCode = 504;
       errorMessage = 'Request timeout';
-    } else if (error.message.includes('redirect')) {
-      statusCode = 508;
-      errorMessage = 'Too many redirects';
     }
 
-    res.setHeader('X-Relay-Duration', duration.toString());
+    res.setHeader('X-Response-Time', `${duration}ms`);
 
     return res.status(statusCode).json({
       status: 'error',
