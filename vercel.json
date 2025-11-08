@@ -1,21 +1,8 @@
 {
   "version": 2,
-  "name": "license-relay",
-  "builds": [
-    {
-      "src": "api/license-check.js",
-      "use": "@vercel/node"
-    }
-  ],
-  "routes": [
-    {
-      "src": "/api/license-check",
-      "dest": "/api/license-check.js"
-    }
-  ],
   "functions": {
     "api/license-check.js": {
-      "maxDuration": 30,
+      "maxDuration": 10,
       "memory": 1024
     }
   }
