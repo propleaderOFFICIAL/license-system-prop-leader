@@ -1,13 +1,13 @@
 // api/license-check.js
 export const config = {
   runtime: 'nodejs',
-  maxDuration: 30, // Solo se hai Vercel Pro, altrimenti rimuovi questa riga
+  // maxDuration: 30, // decommentare solo se hai Vercel Pro
 };
 
 // Configurazione
-const ALLOWED_ORIGINS = ['*']; // Cambia con il tuo dominio se vuoi restringere
-const DEFAULT_TIMEOUT_MS = 25000; // 25 secondi (sotto il limite Vercel)
-const MAX_REDIRECTS = 5; // Google Apps Script può fare più redirect
+const ALLOWED_ORIGINS = ['*'];
+const DEFAULT_TIMEOUT_MS = 9000; // 9 secondi per stare sotto il limite Vercel Hobby (10s)
+const MAX_REDIRECTS = 5;
 
 /**
  * Genera header CORS appropriati
@@ -73,24 +73,19 @@ async function followRedirects(url, options, timeoutMs, maxRedirects = MAX_REDIR
       const location = response.headers.get('location');
       
       if (!location) {
-        // Redirect senza Location header
         return response;
       }
 
-      // URL assoluto o relativo
       currentUrl = location.startsWith('http') 
         ? location 
         : new URL(location, currentUrl).toString();
       
       redirectCount++;
-      
-      // Log per debug (visibile nei log Vercel)
       console.log(`Redirect ${redirectCount}: ${currentUrl}`);
-      
       continue;
     }
 
-    // Altri status (4xx, 5xx) = restituisci la risposta così com'è
+    // Altri status (4xx, 5xx)
     return response;
   }
 
@@ -105,7 +100,7 @@ export default async function handler(req, res) {
   const origin = req.headers.origin || req.headers.referer || '*';
   const corsHeaders = getCorsHeaders(origin);
 
-  // Applica header CORS a tutte le risposte
+  // Applica header CORS
   Object.entries(corsHeaders).forEach(([key, value]) => {
     res.setHeader(key, value);
   });
@@ -120,23 +115,22 @@ export default async function handler(req, res) {
     return res.status(405).json({
       status: 'error',
       message: 'Method Not Allowed. Only POST requests are accepted.',
-      allowedMethods: ['POST', 'OPTIONS'],
     });
   }
 
-  // Verifica che l'environment variable sia configurata
+  // Verifica environment variable
   const targetUrl = process.env.LICENSE_WEBHOOK_URL;
   
   if (!targetUrl) {
     console.error('LICENSE_WEBHOOK_URL not configured');
     return res.status(500).json({
       status: 'error',
-      message: 'Server configuration error: LICENSE_WEBHOOK_URL not set',
+      message: 'Server configuration error',
     });
   }
 
   try {
-    // Prepara il body da inoltrare
+    // Prepara body
     let bodyToForward;
     const contentType = req.headers['content-type'] || 'application/json';
 
@@ -148,9 +142,7 @@ export default async function handler(req, res) {
       bodyToForward = JSON.stringify({});
     }
 
-    // Log request (utile per debug)
-    console.log('Forwarding request to:', targetUrl);
-    console.log('Content-Type:', contentType);
+    console.log('Forwarding to:', targetUrl);
     console.log('Body length:', bodyToForward.length);
 
     // Header da inoltrare
@@ -158,10 +150,9 @@ export default async function handler(req, res) {
       'Content-Type': contentType,
       'Accept': 'application/json, text/plain, */*',
       'User-Agent': req.headers['user-agent'] || 'MT5-VercelRelay/2.0',
-      'Accept-Encoding': 'gzip, deflate',
     };
 
-    // Inoltra la richiesta con gestione redirect
+    // Inoltra richiesta
     const upstreamResponse = await followRedirects(
       targetUrl,
       {
@@ -173,63 +164,36 @@ export default async function handler(req, res) {
       MAX_REDIRECTS
     );
 
-    // Leggi la risposta
+    // Leggi risposta
     const responseBody = await upstreamResponse.text();
     const responseContentType = upstreamResponse.headers.get('content-type') || 'application/json; charset=utf-8';
 
-    // Log response
     const duration = Date.now() - startTime;
-    console.log('Response status:', upstreamResponse.status);
-    console.log('Response length:', responseBody.length);
-    console.log('Duration:', duration, 'ms');
+    console.log('Status:', upstreamResponse.status, 'Duration:', duration, 'ms');
 
-    // Imposta Content-Type della risposta
     res.setHeader('Content-Type', responseContentType);
-    
-    // Aggiungi header custom per debug
     res.setHeader('X-Relay-Duration', duration.toString());
-    res.setHeader('X-Relay-Status', 'success');
 
-    // Restituisci la risposta con lo stesso status code
     return res.status(upstreamResponse.status).send(responseBody);
 
   } catch (error) {
     const duration = Date.now() - startTime;
-    
-    // Log errore dettagliato
-    console.error('Relay error:', error);
-    console.error('Error name:', error.name);
-    console.error('Error message:', error.message);
-    console.error('Duration:', duration, 'ms');
+    console.error('Error:', error.message);
 
-    // Determina il tipo di errore
-    let errorMessage = 'Upstream relay error';
-    let errorDetail = error.message;
     let statusCode = 502;
+    let errorMessage = 'Upstream relay error';
 
     if (error.message.includes('timeout')) {
-      errorMessage = 'Request timeout';
       statusCode = 504;
-    } else if (error.message.includes('DNS')) {
-      errorMessage = 'DNS resolution failed';
-      statusCode = 502;
-    } else if (error.message.includes('ECONNREFUSED')) {
-      errorMessage = 'Connection refused';
-      statusCode = 502;
-    } else if (error.message.includes('redirect')) {
-      errorMessage = 'Too many redirects';
-      statusCode = 508;
+      errorMessage = 'Request timeout';
     }
 
     res.setHeader('X-Relay-Duration', duration.toString());
-    res.setHeader('X-Relay-Status', 'error');
 
     return res.status(statusCode).json({
       status: 'error',
       message: errorMessage,
-      detail: errorDetail,
-      timestamp: new Date().toISOString(),
-      duration: duration,
+      detail: error.message,
     });
   }
 }
