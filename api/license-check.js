@@ -1,17 +1,12 @@
 // api/license-check.js
 export const config = {
   runtime: 'nodejs',
-  // maxDuration: 30, // decommentare solo se hai Vercel Pro
 };
 
-// Configurazione
 const ALLOWED_ORIGINS = ['*'];
-const DEFAULT_TIMEOUT_MS = 9000; // 9 secondi per stare sotto il limite Vercel Hobby (10s)
+const DEFAULT_TIMEOUT_MS = 9000;
 const MAX_REDIRECTS = 5;
 
-/**
- * Genera header CORS appropriati
- */
 function getCorsHeaders(origin) {
   const allowOrigin = ALLOWED_ORIGINS.includes('*') || ALLOWED_ORIGINS.includes(origin)
     ? origin || '*'
@@ -26,9 +21,6 @@ function getCorsHeaders(origin) {
   };
 }
 
-/**
- * Fetch con timeout
- */
 async function fetchWithTimeout(url, options = {}, timeoutMs = DEFAULT_TIMEOUT_MS) {
   const controller = new AbortController();
   const timeoutId = setTimeout(() => controller.abort(), timeoutMs);
@@ -50,21 +42,65 @@ async function fetchWithTimeout(url, options = {}, timeoutMs = DEFAULT_TIMEOUT_M
 }
 
 /**
- * Segue i redirect manualmente (necessario per Google Apps Script)
+ * Converte POST in GET con query parameters dopo il primo redirect
  */
-async function followRedirects(url, options, timeoutMs, maxRedirects = MAX_REDIRECTS) {
+async function followRedirectsWithMethodSwitch(url, jsonBody, timeoutMs, maxRedirects = MAX_REDIRECTS) {
   let currentUrl = url;
   let redirectCount = 0;
+  let usePost = true; // Prima richiesta usa POST
 
   while (redirectCount <= maxRedirects) {
-    const response = await fetchWithTimeout(
-      currentUrl,
-      { ...options, redirect: 'manual' },
-      timeoutMs
-    );
+    let options;
+
+    if (usePost) {
+      // Prima richiesta: POST con JSON body
+      options = {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'Accept': 'application/json, text/plain, */*',
+          'User-Agent': 'MT5-VercelRelay/2.0',
+        },
+        body: jsonBody,
+        redirect: 'manual',
+      };
+      console.log(`Request ${redirectCount + 1}: POST ${currentUrl}`);
+    } else {
+      // Dopo redirect: GET con query parameters
+      try {
+        const data = JSON.parse(jsonBody);
+        const params = new URLSearchParams();
+        
+        // Converti ogni campo in query parameter
+        for (const [key, value] of Object.entries(data)) {
+          if (value !== null && value !== undefined) {
+            params.append(key, typeof value === 'object' ? JSON.stringify(value) : String(value));
+          }
+        }
+        
+        // Aggiungi parameters all'URL
+        const separator = currentUrl.includes('?') ? '&' : '?';
+        currentUrl = `${currentUrl}${separator}${params.toString()}`;
+      } catch (e) {
+        console.error('Error converting POST to GET:', e);
+      }
+
+      options = {
+        method: 'GET',
+        headers: {
+          'Accept': 'application/json, text/plain, */*',
+          'User-Agent': 'MT5-VercelRelay/2.0',
+        },
+        redirect: 'manual',
+      };
+      console.log(`Request ${redirectCount + 1}: GET ${currentUrl}`);
+    }
+
+    const response = await fetchWithTimeout(currentUrl, options, timeoutMs);
 
     // Status 2xx = successo
     if (response.status >= 200 && response.status < 300) {
+      console.log(`Success: ${response.status}`);
       return response;
     }
 
@@ -73,44 +109,43 @@ async function followRedirects(url, options, timeoutMs, maxRedirects = MAX_REDIR
       const location = response.headers.get('location');
       
       if (!location) {
+        console.log('Redirect without location header');
         return response;
       }
 
+      // Risolvi URL relativo o assoluto
       currentUrl = location.startsWith('http') 
         ? location 
         : new URL(location, currentUrl).toString();
       
       redirectCount++;
-      console.log(`Redirect ${redirectCount}: ${currentUrl}`);
+      usePost = false; // Dopo il primo redirect, usa GET
+      
+      console.log(`Redirect ${redirectCount} to: ${currentUrl}`);
       continue;
     }
 
     // Altri status (4xx, 5xx)
+    console.log(`Non-redirect status: ${response.status}`);
     return response;
   }
 
   throw new Error(`Too many redirects (max: ${maxRedirects})`);
 }
 
-/**
- * Handler principale
- */
 export default async function handler(req, res) {
   const startTime = Date.now();
   const origin = req.headers.origin || req.headers.referer || '*';
   const corsHeaders = getCorsHeaders(origin);
 
-  // Applica header CORS
   Object.entries(corsHeaders).forEach(([key, value]) => {
     res.setHeader(key, value);
   });
 
-  // Gestione preflight OPTIONS
   if (req.method === 'OPTIONS') {
     return res.status(204).end();
   }
 
-  // Accetta solo POST
   if (req.method !== 'POST') {
     return res.status(405).json({
       status: 'error',
@@ -118,7 +153,6 @@ export default async function handler(req, res) {
     });
   }
 
-  // Verifica environment variable
   const targetUrl = process.env.LICENSE_WEBHOOK_URL;
   
   if (!targetUrl) {
@@ -130,10 +164,9 @@ export default async function handler(req, res) {
   }
 
   try {
-    // Prepara body
+    // Prepara body JSON
     let bodyToForward;
-    const contentType = req.headers['content-type'] || 'application/json';
-
+    
     if (typeof req.body === 'string') {
       bodyToForward = req.body;
     } else if (req.body && typeof req.body === 'object') {
@@ -142,43 +175,42 @@ export default async function handler(req, res) {
       bodyToForward = JSON.stringify({});
     }
 
-    console.log('Forwarding to:', targetUrl);
+    console.log('=== Incoming Request ===');
+    console.log('Target URL:', targetUrl);
     console.log('Body length:', bodyToForward.length);
+    console.log('Body preview:', bodyToForward.substring(0, 200));
 
-    // Header da inoltrare
-    const forwardHeaders = {
-      'Content-Type': contentType,
-      'Accept': 'application/json, text/plain, */*',
-      'User-Agent': req.headers['user-agent'] || 'MT5-VercelRelay/2.0',
-    };
-
-    // Inoltra richiesta
-    const upstreamResponse = await followRedirects(
+    // Inoltra con conversione automatica POST→GET
+    const upstreamResponse = await followRedirectsWithMethodSwitch(
       targetUrl,
-      {
-        method: 'POST',
-        headers: forwardHeaders,
-        body: bodyToForward,
-      },
+      bodyToForward,
       DEFAULT_TIMEOUT_MS,
       MAX_REDIRECTS
     );
 
-    // Leggi risposta
     const responseBody = await upstreamResponse.text();
     const responseContentType = upstreamResponse.headers.get('content-type') || 'application/json; charset=utf-8';
 
     const duration = Date.now() - startTime;
-    console.log('Status:', upstreamResponse.status, 'Duration:', duration, 'ms');
+    
+    console.log('=== Response ===');
+    console.log('Status:', upstreamResponse.status);
+    console.log('Duration:', duration, 'ms');
+    console.log('Body length:', responseBody.length);
+    console.log('Body preview:', responseBody.substring(0, 200));
 
     res.setHeader('Content-Type', responseContentType);
     res.setHeader('X-Relay-Duration', duration.toString());
+    res.setHeader('X-Relay-Method', 'POST-to-GET');
 
     return res.status(upstreamResponse.status).send(responseBody);
 
   } catch (error) {
     const duration = Date.now() - startTime;
-    console.error('Error:', error.message);
+    
+    console.error('=== Error ===');
+    console.error('Message:', error.message);
+    console.error('Duration:', duration, 'ms');
 
     let statusCode = 502;
     let errorMessage = 'Upstream relay error';
@@ -186,6 +218,9 @@ export default async function handler(req, res) {
     if (error.message.includes('timeout')) {
       statusCode = 504;
       errorMessage = 'Request timeout';
+    } else if (error.message.includes('redirect')) {
+      statusCode = 508;
+      errorMessage = 'Too many redirects';
     }
 
     res.setHeader('X-Relay-Duration', duration.toString());
