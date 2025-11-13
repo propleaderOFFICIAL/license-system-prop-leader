@@ -42,15 +42,14 @@ async function fetchWithTimeout(url, options, timeoutMs) {
 }
 
 async function tryLicenseEndpoints(params) {
-  const allResults = [];
-  let firstValidResponse = null;
+  const errors = [];
   
   for (let i = 0; i < LICENSE_ENDPOINTS.length; i++) {
     const endpoint = LICENSE_ENDPOINTS[i];
     const endpointNum = i + 1;
     
     try {
-      console.log(`[Endpoint ${endpointNum}/${LICENSE_ENDPOINTS.length}] Trying: ${endpoint.substring(0, 60)}...`);
+      console.log(`[Endpoint ${endpointNum}/${LICENSE_ENDPOINTS.length}] Calling...`);
       
       const finalUrl = `${endpoint}?${params.toString()}`;
       const startTime = Date.now();
@@ -72,89 +71,46 @@ async function tryLicenseEndpoints(params) {
       
       console.log(`[Endpoint ${endpointNum}] Status: ${response.status}, Duration: ${duration}ms`);
       
-      // Prova a parsare la risposta
+      // Parse response
       let responseData;
       try {
         responseData = JSON.parse(responseText);
       } catch (e) {
         console.error(`[Endpoint ${endpointNum}] JSON parse error:`, e);
-        allResults.push({
-          endpoint: endpointNum,
-          success: false,
-          error: 'Invalid JSON response',
-          duration,
-        });
-        continue;
+        throw new Error('Invalid JSON response');
       }
       
-      // Salva il risultato
-      allResults.push({
-        endpoint: endpointNum,
-        success: response.ok,
-        status: response.status,
-        data: responseData,
-        duration,
-      });
-      
-      // Se questo endpoint dice che la licenza è VALIDA, salvalo
-      if (response.ok && responseData.status === 'success' && responseData.valid === true) {
-        console.log(`[Endpoint ${endpointNum}] ✓ LICENSE VALID - Using this response`);
-        firstValidResponse = {
-          success: true,
-          data: responseData,
-          status: response.status,
-          endpoint: endpointNum,
-          duration,
-        };
-        // Trovata licenza valida, interrompi il loop
-        break;
-      } else {
-        console.log(`[Endpoint ${endpointNum}] ✗ License not valid or error`);
-      }
-      
-    } catch (error) {
-      console.error(`[Endpoint ${endpointNum}] ✗ NETWORK ERROR:`, error.message);
-      allResults.push({
-        endpoint: endpointNum,
-        success: false,
-        error: error.message,
-      });
-    }
-  }
-  
-  // Se almeno un endpoint ha detto che la licenza è valida, usa quella risposta
-  if (firstValidResponse) {
-    console.log('=== VALID LICENSE FOUND ===');
-    return firstValidResponse;
-  }
-  
-  // Se arriviamo qui, NESSUN endpoint ha detto che la licenza è valida
-  console.log('=== ALL ENDPOINTS: LICENSE INVALID OR UNREACHABLE ===');
-  
-  // Controlla se almeno un endpoint ha risposto (anche negativamente)
-  const hasAnyResponse = allResults.some(r => r.success === true || (r.data && r.data.status));
-  
-  if (hasAnyResponse) {
-    // Almeno un server ha risposto, anche se ha detto "licenza non valida"
-    // Usa l'ultima risposta valida ricevuta
-    const lastValidResponse = allResults.find(r => r.data && r.data.status);
-    
-    if (lastValidResponse) {
-      console.log('Using response from endpoint:', lastValidResponse.endpoint);
+      // Risposta ottenuta con successo, restituiscila
+      console.log(`[Endpoint ${endpointNum}] SUCCESS`);
       return {
         success: true,
-        data: lastValidResponse.data,
-        status: lastValidResponse.status || 200,
-        endpoint: lastValidResponse.endpoint,
-        duration: lastValidResponse.duration,
+        data: responseData,
+        status: response.status,
+        endpoint: endpointNum,
+        duration,
       };
+      
+    } catch (error) {
+      console.error(`[Endpoint ${endpointNum}] FAILED:`, error.message);
+      errors.push({
+        endpoint: endpointNum,
+        error: error.message,
+      });
+      
+      // Se non è l'ultimo endpoint, continua al prossimo
+      if (i < LICENSE_ENDPOINTS.length - 1) {
+        console.log(`[Endpoint ${endpointNum}] Trying next endpoint...`);
+        continue;
+      }
     }
   }
   
-  // Nessun endpoint ha risposto correttamente (tutti offline/errore)
+  // Tutti gli endpoint hanno fallito
+  console.error('ALL ENDPOINTS FAILED');
+  
   return {
     success: false,
-    allResults,
+    errors,
   };
 }
 
@@ -190,7 +146,7 @@ export default async function handler(req, res) {
       bodyData = req.body || {};
     }
     
-    console.log('=== LICENSE CHECK REQUEST ===');
+    console.log('=== REQUEST ===');
     console.log('License Key:', bodyData.licenseKey);
     console.log('Product:', bodyData.product);
     
@@ -202,16 +158,16 @@ export default async function handler(req, res) {
       }
     });
     
-    // Prova tutti gli endpoint
+    // Prova tutti gli endpoint con fallback
     const result = await tryLicenseEndpoints(params);
     
     const totalDuration = Date.now() - startTime;
     
     if (result.success) {
-      console.log('=== RESPONSE OBTAINED ===');
-      console.log(`Used endpoint: ${result.endpoint}/${LICENSE_ENDPOINTS.length}`);
-      console.log(`License valid: ${result.data.valid}`);
-      console.log(`Total duration: ${totalDuration}ms`);
+      console.log('=== RESPONSE ===');
+      console.log('Status:', result.status);
+      console.log('Endpoint:', result.endpoint);
+      console.log('Duration:', totalDuration, 'ms');
       
       res.setHeader('Content-Type', 'application/json');
       res.setHeader('X-Response-Time', `${totalDuration}ms`);
@@ -219,32 +175,40 @@ export default async function handler(req, res) {
       
       return res.status(result.status).json(result.data);
     } else {
-      // TUTTI gli endpoint sono offline o irraggiungibili
-      console.error('=== ALL ENDPOINTS UNREACHABLE ===');
-      console.error(`Total duration: ${totalDuration}ms`);
+      // Tutti gli endpoint hanno fallito
+      console.error('=== ERROR ===');
+      console.error('All endpoints failed');
+      console.error('Duration:', totalDuration, 'ms');
       
       res.setHeader('X-Response-Time', `${totalDuration}ms`);
       
-      return res.status(503).json({
+      return res.status(504).json({
         status: 'error',
-        message: 'All license servers unreachable',
-        attempts: LICENSE_ENDPOINTS.length,
-        results: result.allResults,
+        message: 'Request timeout',
+        detail: 'All license servers unavailable',
       });
     }
     
   } catch (error) {
     const duration = Date.now() - startTime;
     
-    console.error('=== UNEXPECTED ERROR ===');
+    console.error('=== ERROR ===');
     console.error('Message:', error.message);
     console.error('Duration:', duration, 'ms');
     
+    let statusCode = 502;
+    let errorMessage = 'License server error';
+    
+    if (error.name === 'AbortError' || error.message.includes('timeout')) {
+      statusCode = 504;
+      errorMessage = 'Request timeout';
+    }
+    
     res.setHeader('X-Response-Time', `${duration}ms`);
     
-    return res.status(500).json({
+    return res.status(statusCode).json({
       status: 'error',
-      message: 'Internal server error',
+      message: errorMessage,
       detail: error.message,
     });
   }
